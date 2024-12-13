@@ -2,8 +2,10 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import os
+import sys
 import time
 import warnings
 import joblib
@@ -18,6 +20,7 @@ import xgboost as xgb
 from xgboost import XGBClassifier
 from xgboost import XGBRegressor
 from xgboost import plot_importance, plot_tree
+from xgboost.callback import EarlyStopping
 
 from sklearn.metrics import explained_variance_score, precision_score, confusion_matrix
 from sklearn.model_selection import train_test_split
@@ -39,10 +42,7 @@ def multi_model_predict_result(multi_model, x):
     mu_vec = np.zeros((n_data, n_model))
 
     for i in range(n_model):
-        #mu_temp = multi_model[i].predict(x)
-        #mu_vec[:,i] = mu_temp
-
-        mu_temp = multi_model[i].predict_proba(x) # Class 대신 Probability를 얻을 수도 있다.
+        mu_temp = multi_model[i].predict_proba(x)
         mu_vec[:,i] = mu_temp[:,1]
 
     for k in range(n_data):
@@ -64,10 +64,7 @@ def multi_model_predict(multi_model, x):
     y_vec = np.zeros((n_data, n_model))
 
     for i in range(n_model):
-        #y_temp = multi_model[i].predict(x)
-        #y_vec[:,i] = y_temp
-
-        y_temp = multi_model[i].predict_proba(x)  # Class 대신 Probability를 얻을 수도 있다.
+        y_temp = multi_model[i].predict_proba(x)
         y_vec[:, i] = y_temp[:, 1]
 
     for k in range(n_data):
@@ -78,6 +75,10 @@ def multi_model_predict(multi_model, x):
 
     return mu, std
 
+
+# NOTE: for debugging
+is_verbos = False
+is_show_graph = True
 
 file_name = "heart_final_train.csv"
 # "age", "sex", "cp", "trtbps", "chol", "fbs", "restecg", "thalachh", "exng", "oldpeak", "slp", "caa", "thall", "output"
@@ -91,12 +92,15 @@ df_encoded[boolean_columns] = df_encoded[boolean_columns].astype(int)
 
 data_cnt = 40
 n_ensemble = 7
-df_init_40 = df_encoded.sample(n=data_cnt)
+df_init_40 = df_encoded.groupby('output', group_keys=False).apply(lambda x: x.sample(min(len(x), data_cnt // 2)))
 df_else = df_encoded.drop(df_init_40.index)
 df_add = pd.DataFrame(columns=df_encoded.columns).astype(df_encoded.dtypes)
 
-# FIXME: Check case before testing
-while data_cnt < 120:
+all_accuracy = []
+
+train_start_time = time.time()
+
+while True:
     list_model = []
     list_X_train = []
     list_y_train = []
@@ -104,12 +108,16 @@ while data_cnt < 120:
     list_fi_shap = []
 
     df_data = pd.concat([df_init_40, df_add])
-    
-    print(f"data count: {len(df_data)}")
 
-    df_X = df_data.loc[:, ["age", "sex", "trtbps", "chol", "fbs", "thalachh", "exng", "oldpeak", "caa", "cp_0", "cp_1",
-                           "cp_2", "cp_3", "restecg_0", "restecg_1", "restecg_2", "slp_0", "slp_1", "slp_2", "thall_0",
-                           "thall_1", "thall_2", "thall_3"]]
+    if len(df_data) > 120:
+        break
+
+    if is_verbos:
+        print(f"data count: {len(df_data)}")
+
+    df_X = df_data.loc[:, ["age", "sex", "trtbps", "chol", "fbs", "thalachh", "exng", "oldpeak", "caa",
+                           "cp_0", "cp_1", "cp_2", "cp_3", "restecg_0", "restecg_1", "restecg_2",
+                           "slp_0", "slp_1", "slp_2", "thall_0", "thall_1", "thall_2", "thall_3"]]
     df_y = df_data.loc[:, "output"]
 
     X_train_init, X_test, y_train_init, y_test = train_test_split(df_X, df_y, test_size=0.3)
@@ -134,25 +142,41 @@ while data_cnt < 120:
     start = time.time()
 
     for i in range(n_ensemble):
-        model = XGBClassifier(
-                learning_rate=0.05,
-                n_estimators=500,
-                max_depth=5,
-                min_child_weight=5,
-                gamma=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_alpha=0.01,
-                objective='binary:logistic',
-                nthread=4,
-                scale_pos_weight=1)
+        X_train = list_X_train[i]
+        y_train = list_y_train[i]
 
-        model.fit(list_X_train[i], list_y_train[i])
+        model = XGBClassifier(
+            learning_rate=0.03,
+            n_estimators=1000,
+            max_depth=6,
+            min_child_weight=3,
+            gamma=0.2,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.05,
+            reg_lambda=0.1,
+            objective='binary:logistic',
+            nthread=4,
+            scale_pos_weight=1
+        )
+
+        # Split X_train and y_train into training and validation sets
+        X_train_model, X_val, y_train_model, y_val = train_test_split(
+            X_train, y_train, test_size=0.1, stratify=y_train
+        )
+
+        model.fit(
+            X_train_model,
+            y_train_model,
+            eval_set=[(X_val, y_val)],
+            verbose=False
+        )
 
         list_model.append(copy.deepcopy(model))
 
     end = time.time()
-    print(f"학습에 걸린 시간 : {end - start:.5f} sec")
+    if is_verbos:
+        print(f"model train time : {end - start:.5f} sec")
 
     list_train_accuracy = []
 
@@ -168,8 +192,6 @@ while data_cnt < 120:
 
         list_train_accuracy.append(n_correct / n_train)
 
-        # print(f'<< Training Results{i}: %g >>' % (n_correct / n_train))
-
     list_test_accuracy = []
 
     for i in range(n_ensemble):
@@ -180,8 +202,6 @@ while data_cnt < 120:
         n_correct = np.size(np.where((y_test - y_est) == 0))
 
         list_test_accuracy.append(n_correct / n_test)
-
-        # print(f'<< Test Results{i}: %g >>' % (n_correct / n_test))
 
     df_X_test = df_else.loc[:, ["age", "sex", "trtbps", "chol", "fbs", "thalachh", "exng", "oldpeak", "caa",
                                 "cp_0", "cp_1", "cp_2", "cp_3", "restecg_0", "restecg_1", "restecg_2",
@@ -205,7 +225,22 @@ while data_cnt < 120:
     n_test = len(df_y_test)
     n_correct = np.size(np.where((df_y_test - y_est) == 0))
 
-    print(f'<< Test Results from Ensemble Model >>')
-    print('accuracy(individual)=', list_test_accuracy)
-    print('accuracy(ensemble)=%g' % (n_correct / n_test))
-    print()
+    all_accuracy.append(n_correct / n_test)
+
+    if is_verbos:
+        print(f'<< Test Results from Ensemble Model >>')
+        print('accuracy(individual)=', list_test_accuracy)
+        print('accuracy(ensemble)=%g\n' % (n_correct / n_test))
+
+train_end_time = time.time()
+
+print(f"total train time : {train_end_time - train_start_time:.5f} sec")
+print(f"final test accuracy : {all_accuracy[-1]}")
+
+if is_show_graph:
+    plt.plot(np.arange(40, 40 + 5 * len(all_accuracy), 5), all_accuracy, marker='o')
+    plt.xlabel("data count")
+    plt.ylabel("accuracy")
+    plt.title("ensemble accuracy with sampling")
+    plt.grid(True)
+    plt.show()
